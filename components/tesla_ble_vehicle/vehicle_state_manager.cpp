@@ -83,8 +83,47 @@ void VehicleStateManager::update_vehicle_status(const VCSEC_VehicleStatus& statu
     update_user_presence(status.userPresence);
     
     if (status.has_closureStatuses) {
-        bool flap_open = (status.closureStatuses.chargePort == VCSEC_ClosureState_E_CLOSURESTATE_OPEN);
+        const auto &cs = status.closureStatuses;
+        bool flap_open = (cs.chargePort == VCSEC_ClosureState_E_CLOSURESTATE_OPEN);
         update_charge_flap_open(flap_open);
+
+        // rev9v3 SPEED-UP: doors / trunk / frunk are ALSO reported by VCSEC, i.e. by the
+        // same fast poll that already delivers the lock state. Before this change they only
+        // came from the (slower, awake-only) Infotainment CarServer closures message.
+        // OPEN and AJAR count as "open"; UNKNOWN/other values are ignored so a bad report
+        // can never be shown as "closed".
+        auto closure_open = [](int s, bool &open) -> bool {
+            switch (s) {
+                case VCSEC_ClosureState_E_CLOSURESTATE_OPEN:
+                case VCSEC_ClosureState_E_CLOSURESTATE_AJAR:
+                    open = true;
+                    return true;
+                case VCSEC_ClosureState_E_CLOSURESTATE_CLOSED:
+                    open = false;
+                    return true;
+                default:
+                    return false;
+            }
+        };
+        bool open = false;
+        if (closure_open(cs.frontDriverDoor, open)) publish_binary_sensor("door_driver_front", open);
+        if (closure_open(cs.frontPassengerDoor, open)) publish_binary_sensor("door_passenger_front", open);
+        if (closure_open(cs.rearDriverDoor, open)) publish_binary_sensor("door_driver_rear", open);
+        if (closure_open(cs.rearPassengerDoor, open)) publish_binary_sensor("door_passenger_rear", open);
+        if (closure_open(cs.rearTrunk, open)) {
+            if (trunk_cover_ != nullptr) {
+                trunk_cover_->position = open ? cover::COVER_OPEN : cover::COVER_CLOSED;
+                trunk_cover_->publish_state();
+            }
+            publish_binary_sensor("boot_open", open);
+        }
+        if (closure_open(cs.frontTrunk, open)) {
+            if (frunk_cover_ != nullptr) {
+                frunk_cover_->position = open ? cover::COVER_OPEN : cover::COVER_CLOSED;
+                frunk_cover_->publish_state();
+            }
+            publish_binary_sensor("frunk_open", open);
+        }
     }
 }
 
@@ -116,7 +155,6 @@ void VehicleStateManager::update_user_presence(VCSEC_UserPresence_E presence) {
 void VehicleStateManager::update_charge_state(const CarServer_ChargeState& charge_state) {
     
     if (charge_state.has_charging_state) {
-        const bool was_charging = is_charging_;
         const bool new_charging_state = (
             charge_state.charging_state.which_type == CarServer_ChargeState_ChargingState_Charging_tag ||
             charge_state.charging_state.which_type == CarServer_ChargeState_ChargingState_Starting_tag
@@ -428,10 +466,6 @@ void VehicleStateManager::update_closures_state(const CarServer_ClosuresState& c
     }
     const bool any_window_open = window_df || window_dr || window_pf || window_pr;
     
-    if (windows_cover_ != nullptr) {
-        windows_cover_->position = any_window_open ? cover::COVER_OPEN : cover::COVER_CLOSED;
-        windows_cover_->publish_state();
-    }
     // Migrated from PedroKTFC/esphome-tesla-ble: "windows_state" aggregate binary sensor,
     // in addition to the per-window binary sensors and the Windows Cover entity above.
     // BUGFIX: only publish when ALL FOUR window fields are present in the message
@@ -442,6 +476,11 @@ void VehicleStateManager::update_closures_state(const CarServer_ClosuresState& c
         closures_state.which_optional_window_open_passenger_front &&
         closures_state.which_optional_window_open_passenger_rear) {
         publish_binary_sensor("windows_state", any_window_open);
+        // rev9v3: Cover now follows the same "all four fields present" rule.
+        if (windows_cover_ != nullptr) {
+            windows_cover_->position = any_window_open ? cover::COVER_OPEN : cover::COVER_CLOSED;
+            windows_cover_->publish_state();
+        }
     }
     
     if (closures_state.which_optional_sun_roof_percent_open) {
