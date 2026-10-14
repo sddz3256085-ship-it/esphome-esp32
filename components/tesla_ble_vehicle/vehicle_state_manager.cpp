@@ -90,12 +90,15 @@ void VehicleStateManager::update_vehicle_status(const VCSEC_VehicleStatus& statu
         // rev9v3 SPEED-UP: doors / trunk / frunk are ALSO reported by VCSEC, i.e. by the
         // same fast poll that already delivers the lock state. Before this change they only
         // came from the (slower, awake-only) Infotainment CarServer closures message.
-        // OPEN and AJAR count as "open"; UNKNOWN/other values are ignored so a bad report
-        // can never be shown as "closed".
+        // OPEN, AJAR, OPENING and CLOSING all count as "open" (the door is not
+        // fully closed yet). UNKNOWN and any other value are ignored, so a bad
+        // report can never be shown as "closed".
         auto closure_open = [](int s, bool &open) -> bool {
             switch (s) {
                 case VCSEC_ClosureState_E_CLOSURESTATE_OPEN:
                 case VCSEC_ClosureState_E_CLOSURESTATE_AJAR:
+                case VCSEC_ClosureState_E_CLOSURESTATE_OPENING:
+                case VCSEC_ClosureState_E_CLOSURESTATE_CLOSING:
                     open = true;
                     return true;
                 case VCSEC_ClosureState_E_CLOSURESTATE_CLOSED:
