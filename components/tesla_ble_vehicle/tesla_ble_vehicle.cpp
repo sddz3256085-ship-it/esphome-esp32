@@ -2,6 +2,7 @@
 #include "common.h"
 #include <client.h>
 #include <cstring>
+#include <algorithm>
 #include <defs.h>
 #include <esp_log.h>
 #include <esphome/core/helpers.h>
@@ -99,22 +100,75 @@ void TeslaBLEVehicle::configure_pending_sensors() {
 void TeslaBLEVehicle::loop() { if (vehicle_) vehicle_->loop(); if (ble_adapter_) ble_adapter_->process_write_queue(); }
 
 void TeslaBLEVehicle::update() {
-  // Migrated from PedroKTFC/esphome-tesla-ble: keep the "ble_disconnected_time" sensor fresh
-  // even while disconnected (the early-return below only covers the "do nothing else" path).
+  // Keep the disconnect-duration sensor updated while BLE is unavailable.
   if (ble_disconnected_since_ != 0 && state_manager_) {
     state_manager_->update_ble_disconnected_seconds((millis() - ble_disconnected_since_) / 1000.0f);
   }
   if (!is_connected() || !vehicle_) return;
-  uint32_t now = millis();
-  if (now - last_vcsec_poll_ >= vcsec_poll_interval_) { ESP_LOGI(TAG, "Polling VCSEC"); vehicle_->vcsec_poll(); last_vcsec_poll_ = now; }
-  const bool is_asleep = state_manager_->is_asleep();
-  // Active = needs more frequent infotainment polling (charging, user in car, climate on, or moving)
-  const bool is_active = state_manager_->is_charging() || state_manager_->is_user_present() ||
-                         state_manager_->is_unlocked() || state_manager_->is_climate_on();
-  uint32_t infotainment_interval = infotainment_poll_interval_awake_;
-  if (is_asleep) infotainment_interval = infotainment_sleep_timeout_;
-  else if (is_active) infotainment_interval = infotainment_poll_interval_active_;
-  if (now - last_infotainment_poll_ >= infotainment_interval) { ESP_LOGI(TAG, "Polling Infotainment"); vehicle_->infotainment_poll(!is_asleep); last_infotainment_poll_ = now; }
+
+  const uint32_t now = millis();
+  if (now - last_vcsec_poll_ >= vcsec_poll_interval_) {
+    ESP_LOGD(TAG, "Polling VCSEC");
+    vehicle_->vcsec_poll();
+    last_vcsec_poll_ = now;
+  }
+
+  const bool has_state_manager = state_manager_ != nullptr;
+  const bool is_asleep = has_state_manager && state_manager_->is_asleep();
+  // Preserve the current fast/slow policy for drive-state polling.
+  const bool is_active = has_state_manager &&
+                         (state_manager_->is_charging() || state_manager_->is_user_present() ||
+                          state_manager_->is_unlocked() || state_manager_->is_climate_on());
+  uint32_t drive_interval = infotainment_poll_interval_awake_;
+  if (is_asleep) {
+    drive_interval = infotainment_sleep_timeout_;
+  } else if (is_active) {
+    drive_interval = infotainment_poll_interval_active_;
+  }
+
+  if (now - last_drive_poll_ >= drive_interval) {
+    ESP_LOGD(TAG, "Polling Drive State");
+    vehicle_->drive_state_poll(!is_asleep);
+    last_drive_poll_ = now;
+  }
+
+  // Closure data needs fast refresh, but do not let the YAML's temporary 1 s
+  // active-interval override turn this into another high-rate polling stream.
+  const uint32_t closures_interval = is_asleep ? infotainment_sleep_timeout_ : 3000U;
+  if (now - last_closures_poll_ >= closures_interval) {
+    ESP_LOGD(TAG, "Polling Closures State");
+    vehicle_->closures_state_poll(!is_asleep);
+    last_closures_poll_ = now;
+  }
+
+  // Defer non-time-critical requests to avoid filling the serial command queue.
+  // Do not send these while the vehicle is asleep; their timers restart after wake.
+  if (is_asleep) {
+    last_charge_poll_ = now;
+    last_climate_poll_ = now;
+    last_tire_pressure_poll_ = now;
+    return;
+  }
+
+  constexpr uint32_t CHARGE_POLL_INTERVAL_MS = 15000U;
+  constexpr uint32_t CLIMATE_POLL_INTERVAL_MS = 30000U;
+  constexpr uint32_t TIRE_PRESSURE_POLL_INTERVAL_MS = 300000U;
+
+  if (now - last_charge_poll_ >= CHARGE_POLL_INTERVAL_MS) {
+    ESP_LOGD(TAG, "Polling Charge State (low priority)");
+    vehicle_->charge_state_poll(true);
+    last_charge_poll_ = now;
+  }
+  if (now - last_climate_poll_ >= CLIMATE_POLL_INTERVAL_MS) {
+    ESP_LOGD(TAG, "Polling Climate State (low priority)");
+    vehicle_->climate_state_poll(true);
+    last_climate_poll_ = now;
+  }
+  if (now - last_tire_pressure_poll_ >= TIRE_PRESSURE_POLL_INTERVAL_MS) {
+    ESP_LOGD(TAG, "Polling Tire Pressure (low priority)");
+    vehicle_->tire_pressure_poll(true);
+    last_tire_pressure_poll_ = now;
+  }
 }
 
 void TeslaBLEVehicle::dump_config() {
@@ -123,7 +177,8 @@ void TeslaBLEVehicle::dump_config() {
   ESP_LOGCONFIG(TAG, "  Role: %s", role_.c_str());
   ESP_LOGCONFIG(TAG, "  Max Charging Amps: %ld",
                  static_cast<long>(state_manager_ ? state_manager_->get_charging_amps_max() : 32));
-  ESP_LOGCONFIG(TAG, "  Polling: VCSEC=%ums, Awake=%ums, Active=%ums", vcsec_poll_interval_, infotainment_poll_interval_awake_, infotainment_poll_interval_active_);
+  ESP_LOGCONFIG(TAG, "  Polling: VCSEC=%ums, Drive awake=%ums/active=%ums, Closures<=3000ms", vcsec_poll_interval_, infotainment_poll_interval_awake_, infotainment_poll_interval_active_);
+  ESP_LOGCONFIG(TAG, "  Low-priority polling: Charge=15000ms, Climate=30000ms, Tire pressure=300000ms");
   ESP_LOGCONFIG(TAG, "  Sensors: %u binary, %u numeric, %u text",
                  static_cast<unsigned>(pending_binary_sensors_.size()),
                  static_cast<unsigned>(pending_sensors_.size()),
@@ -220,10 +275,22 @@ int TeslaBLEVehicle::regenerate_key() {
 }
 
 void TeslaBLEVehicle::force_update() {
-  uint32_t now = millis();
-  if (now - last_infotainment_poll_ < infotainment_poll_interval_active_) { ESP_LOGD(TAG, "Force update requested too soon - ignoring"); return; }
-  ESP_LOGI(TAG, "Force update requested"); last_infotainment_poll_ = now;
-  if (vehicle_) { vehicle_->vcsec_poll(); vehicle_->infotainment_poll(true); }
+  const uint32_t now = millis();
+  if (now - last_drive_poll_ < infotainment_poll_interval_active_) {
+    ESP_LOGD(TAG, "Force update requested too soon - ignoring");
+    return;
+  }
+  ESP_LOGI(TAG, "Force update requested");
+  if (vehicle_) {
+    vehicle_->vcsec_poll();
+    vehicle_->drive_state_poll(true);
+    vehicle_->closures_state_poll(true);
+    vehicle_->charge_state_poll(true);
+    last_vcsec_poll_ = now;
+    last_drive_poll_ = now;
+    last_closures_poll_ = now;
+    last_charge_poll_ = now;
+  }
 }
 
 int TeslaBLEVehicle::set_charging_state(bool charging) {
@@ -300,8 +367,20 @@ void TeslaBLEVehicle::gattc_event_handler(esp_gattc_cb_event_t event, esp_gatt_i
   ESP_LOGV(TAG, "GATTC event %d", event);
   switch (event) {
     case ESP_GATTC_OPEN_EVT: if (param->open.status == ESP_GATT_OK) ESP_LOGI(TAG, "BLE physical link established"); break;
-    case ESP_GATTC_CLOSE_EVT: ESP_LOGW(TAG, "BLE connection closed"); handle_connection_lost(); break;
-    case ESP_GATTC_DISCONNECT_EVT: ESP_LOGW(TAG, "BLE disconnected"); this->read_handle_ = 0; this->write_handle_ = 0; this->node_state = espbt::ClientState::DISCONNECTING; break;
+    case ESP_GATTC_CLOSE_EVT:
+      ESP_LOGW(TAG, "BLE connection closed");
+      this->read_handle_ = 0;
+      this->write_handle_ = 0;
+      this->node_state = espbt::ClientState::DISCONNECTING;
+      handle_connection_lost();
+      break;
+    case ESP_GATTC_DISCONNECT_EVT:
+      ESP_LOGW(TAG, "BLE disconnected");
+      this->read_handle_ = 0;
+      this->write_handle_ = 0;
+      this->node_state = espbt::ClientState::DISCONNECTING;
+      handle_connection_lost();
+      break;
     case ESP_GATTC_SEARCH_CMPL_EVT: {
       auto *readChar = this->parent()->get_characteristic(this->service_uuid_, this->read_uuid_);
       if (readChar == nullptr) { ESP_LOGE(TAG, "Read characteristic not found"); break; }
@@ -321,10 +400,25 @@ void TeslaBLEVehicle::gattc_event_handler(esp_gattc_cb_event_t event, esp_gatt_i
 }
 
 void TeslaBLEVehicle::handle_connection_established() {
-  if (vehicle_) { vehicle_->set_connected(true); ESP_LOGI(TAG, "Connection established - triggering initial polls"); vehicle_->vcsec_poll(); vehicle_->infotainment_poll(true); last_vcsec_poll_ = millis(); last_infotainment_poll_ = millis(); }
+  connection_loss_handled_ = false;
+  const uint32_t now = millis();
+  if (vehicle_) {
+    vehicle_->set_connected(true);
+    ESP_LOGI(TAG, "Connection established - queuing priority polls");
+    // Keep initial queue short and status-oriented: VCSEC, drive, closures, then charge.
+    vehicle_->vcsec_poll();
+    vehicle_->drive_state_poll(true);
+    vehicle_->closures_state_poll(true);
+    vehicle_->charge_state_poll(true);
+    last_vcsec_poll_ = now;
+    last_drive_poll_ = now;
+    last_closures_poll_ = now;
+    last_charge_poll_ = now;
+    last_climate_poll_ = now;
+    last_tire_pressure_poll_ = now;
+  }
   if (state_manager_) state_manager_->set_sensors_available(true);
-  // Migrated from PedroKTFC/esphome-tesla-ble: reset the "ble_disconnected_time" sensor
-  // back to 0 now that the link is back up.
+  // Reset the disconnect-duration sensor once the GATT connection is usable.
   if (ble_disconnected_since_ != 0) {
     ble_disconnected_since_ = 0;
     if (state_manager_) state_manager_->update_ble_disconnected_seconds(0.0f);
@@ -333,13 +427,23 @@ void TeslaBLEVehicle::handle_connection_established() {
 }
 
 void TeslaBLEVehicle::handle_connection_lost() {
+  // DISCONNECT_EVT and CLOSE_EVT can both fire for the same connection loss.
+  // Clean queues and mark sensors unavailable only once for each established link.
+  if (connection_loss_handled_) {
+    ESP_LOGD(TAG, "Ignoring duplicate BLE disconnect cleanup");
+    return;
+  }
+  connection_loss_handled_ = true;
+
   if (vehicle_) vehicle_->set_connected(false);
   if (ble_adapter_) ble_adapter_->clear_queues();
-  last_infotainment_poll_ = 0; last_vcsec_poll_ = 0;
+  last_vcsec_poll_ = 0;
+  last_drive_poll_ = 0;
+  last_closures_poll_ = 0;
+  last_charge_poll_ = 0;
+  last_climate_poll_ = 0;
+  last_tire_pressure_poll_ = 0;
   if (state_manager_) state_manager_->set_sensors_available(false);
-  // Migrated from PedroKTFC/esphome-tesla-ble: start the "ble_disconnected_time" clock.
-  // Only set it the first time we notice the link is down, so repeated CLOSE/DISCONNECT
-  // events (which can both fire for one drop) don't keep resetting the timer to "now".
   if (ble_disconnected_since_ == 0) {
     ble_disconnected_since_ = millis();
   }
