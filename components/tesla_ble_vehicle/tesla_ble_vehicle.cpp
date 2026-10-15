@@ -154,15 +154,20 @@ void TeslaBLEVehicle::update() {
   constexpr uint32_t CLIMATE_POLL_INTERVAL_MS = 30000U;
   constexpr uint32_t TIRE_PRESSURE_POLL_INTERVAL_MS = 300000U;
 
+  // Only enqueue one low-priority request per component update tick. These
+  // deadlines often coincide (e.g. charge + climate every 30s and all three
+  // every 300s); serializing them avoids a burst on the shared FIFO command queue.
   if (now - last_charge_poll_ >= CHARGE_POLL_INTERVAL_MS) {
     ESP_LOGD(TAG, "Polling Charge State (low priority)");
     vehicle_->charge_state_poll(true);
     last_charge_poll_ = now;
+    return;
   }
   if (now - last_climate_poll_ >= CLIMATE_POLL_INTERVAL_MS) {
     ESP_LOGD(TAG, "Polling Climate State (low priority)");
     vehicle_->climate_state_poll(true);
     last_climate_poll_ = now;
+    return;
   }
   if (now - last_tire_pressure_poll_ >= TIRE_PRESSURE_POLL_INTERVAL_MS) {
     ESP_LOGD(TAG, "Polling Tire Pressure (low priority)");
