@@ -148,7 +148,12 @@ private:
     int charging_amps_max_{32};  // Local cache - applied to state_manager_ when ready
 
     uint32_t last_vcsec_poll_{0};
-    uint32_t last_infotainment_poll_{0};
+    uint32_t last_drive_poll_{0};
+    uint32_t last_closures_poll_{0};
+    uint32_t last_charge_poll_{0};
+    uint32_t last_climate_poll_{0};
+    uint32_t last_tire_pressure_poll_{0};
+    bool connection_loss_handled_{true};
 
     // Migrated from PedroKTFC/esphome-tesla-ble: timestamp (millis()) the BLE link was lost,
     // 0 while connected. Initialised to millis() in setup() (like Pedro does) so the
